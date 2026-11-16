@@ -20,6 +20,7 @@ Options (place after the command)
   --project TEXT   List or search. Match part of the working directory,
                    ignoring case.
   --title TEXT     List. Match part of the session title, ignoring case.
+  --include-rewound  Claude commands. Include older transcripts replaced by a Desktop rewind.
   --no-children    Claude search. Restrict the default parent-and-subagent search
                    to top-level sessions. Child hits include the parent ID.
   --limit N        List or search. Return up to N sessions or hits (default 20).
@@ -107,6 +108,9 @@ telemetry are skipped; non-text message attachments are indicated by type."""),
         for cmd, (summary, examples) in details.items():
             sub = subs.add_parser(cmd, help=summary, description=summary, epilog=examples,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
+            if source == "claude":
+                sub.add_argument("--include-rewound", action="store_true",
+                                 help="also include superseded Claude Desktop rewind transcripts")
             sub.add_argument("--json", action="store_true", help="emit JSON Lines for scripts and agents")
             if cmd != "read":
                 sub.add_argument("--project", help="case-insensitive substring of the working directory")
@@ -156,7 +160,7 @@ telemetry are skipped; non-text message attachments are indicated by type."""),
     try:
         if getattr(a, "start", None) and a.end and a.start > a.end:
             raise ValueError("--to precedes --from")
-        sessions = inventory(a.source)
+        sessions = inventory(a.source, include_rewound=getattr(a, "include_rewound", False))
         if a.command == "read":
             if a.last is not None:
                 if a.last < 1:

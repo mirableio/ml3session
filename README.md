@@ -41,6 +41,8 @@ ml3session claude search "connection refused"
 
 A search hit gives you the session ID, timestamp, speaker, matching excerpt, and a **cursor** for the record containing the match. Search is literal and case-insensitive. Add `--tools` to search recorded tool inputs and outputs. Both `list` and `search` visit recently modified sessions first and return up to 20 rows by default. Use `--limit N` to change that.
 
+When Desktop rewind metadata is available, Claude commands skip superseded transcript IDs. The current transcript and separate forked chats remain discoverable. To inspect an old version explicitly, add `--include-rewound` to `list`, `search`, or `read`. Without Desktop metadata, discovery falls back to the transcript files.
+
 Claude search includes subagents. A child hit gives you its own session ID and the parent ID, so you can read the delegated work or return to the main conversation. To browse a parent's agents, use `ml3session claude list --children SESSION`. To search only top-level chats, add `--no-children`.
 
 ## Read the exchange

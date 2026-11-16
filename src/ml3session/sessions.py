@@ -140,7 +140,43 @@ class Session:
                 yield pos, line, item
 
 
-def inventory(source=None):
+def rewound_transcripts():
+    """Collect replaced CLI IDs from Desktop rewind edges, preserving every current chat."""
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return set()
+        root = Path(appdata) / "Claude"
+    else:
+        root = Path.home() / "Library" / "Application Support" / "Claude"
+    current = set()
+    rewound = set()
+    for path in (root / "claude-code-sessions").glob("*/*/local_*.json"):
+        try:
+            record = json.loads(path.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        active = record.get("cliSessionId")
+        if not isinstance(active, str) or not UUID.fullmatch(active):
+            continue
+        current.add(active.lower())
+        edges = record.get("rewindEdges")
+        if not isinstance(edges, list):
+            continue
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            # Either endpoint can be inactive after Undo rewind.
+            for key in ("parent", "child"):
+                endpoint = edge.get(key)
+                if isinstance(endpoint, str) and UUID.fullmatch(endpoint):
+                    rewound.add(endpoint.lower())
+    return rewound - current
+
+
+def inventory(source=None, *, include_rewound=False):
     roots = {
         "claude": Path(os.getenv("CLAUDE_CONFIG_DIR", Path.home() / ".claude")),
         "codex": Path(os.getenv("CODEX_HOME", Path.home() / ".codex")),
@@ -151,12 +187,16 @@ def inventory(source=None):
     for kind, root in roots.items():
         if source and kind != source:
             continue
+        hidden = rewound_transcripts() if kind == "claude" and not include_rewound else set()
         for pattern in patterns[kind]:
             for path in root.glob(pattern):
                 name = path.name.removesuffix(".zst").removesuffix(".jsonl")
                 match = UUID.search(name)
                 if match and path.name.endswith((".jsonl", ".jsonl.zst")):
-                    item = Session(kind, match.group().lower(), path, path.stat().st_mtime)
+                    session_id = match.group().lower()
+                    if session_id in hidden:
+                        continue
+                    item = Session(kind, session_id, path, path.stat().st_mtime)
                     if item.key not in found or found[item.key].modified < item.modified:
                         found[item.key] = item
     return sorted(found.values(), key=lambda x: x.modified, reverse=True)

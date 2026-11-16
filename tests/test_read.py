@@ -277,3 +277,29 @@ class ReadTest(unittest.TestCase):
         self.assertEqual([r["text"] for r in read()[:-1]], ["Question"])
         self.assertNotEqual(self.run_cli("read", self.id, "--at", hit["cursor"], source="codex",
                                          check=False).returncode, 0)
+
+    def test_desktop_rewind_visibility(self):
+        self.env.update(HOME=str(self.root), APPDATA=str(self.root))
+        app_dir = self.root if sys.platform == "win32" else self.root / "Library/Application Support"
+        metadata = app_dir / "Claude/claude-code-sessions/account/workspace"
+        metadata.mkdir(parents=True)
+        old = self.id
+        latest = old[:-1] + "2"
+        fork = old[:-1] + "3"
+        for ident, text in ((old, "discarded work"), (latest, "new work"), (fork, "fork work")):
+            self.log = self.log.with_name(ident + ".jsonl")
+            self.write({"type": "custom-title", "customTitle": "Shared title"},
+                       {"type": "user", "message": {"content": text}})
+        record = {"cliSessionId": latest, "rewindEdges": [{"parent": old, "child": latest}]}
+        path = metadata / ("local_" + old + ".json")
+        path.write_text(json.dumps(record))
+        (metadata / ("local_" + fork + ".json")).write_text(json.dumps(
+            {"cliSessionId": fork, "forkedFromSessionId": "local_" + old}))
+        self.assertEqual({r["session"] for r in self.rows("list")}, {latest, fork})
+        self.assertEqual(self.rows("search", "discarded work"), [])
+        self.assertNotEqual(self.run_cli("read", old, check=False).returncode, 0)
+        self.assertEqual(self.rows("search", "discarded work", "--include-rewound")[0]["session"], old)
+        self.assertEqual(self.rows("read", old, "--include-rewound")[0]["text"], "discarded work")
+        record["cliSessionId"] = old
+        path.write_text(json.dumps(record))
+        self.assertEqual({r["session"] for r in self.rows("list")}, {old, fork})

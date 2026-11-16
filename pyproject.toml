@@ -1,0 +1,13 @@
+[project]
+name = "ml3session"
+version = "0.1.0"
+description = "Search and read local Claude Code and Codex session transcripts"
+requires-python = ">=3.9"
+dependencies = ["zstandard; python_version < '3.14'"]
+
+[project.scripts]
+ml3session = "ml3session:main"
+
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"

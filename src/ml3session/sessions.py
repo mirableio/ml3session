@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from functools import cache, cached_property
 import io
 import json
+import mmap
 import os
 from pathlib import Path
 import re
@@ -103,6 +104,15 @@ class Session:
             yield no, line, record
 
 
+    def metadata(self):
+        return meta(self)
+
+    def child_sessions(self):
+        return children(self)
+
+    def view_events(self, record, **options):
+        yield from events(self.source, record, **options)
+
     @cached_property
     def snapshot_line(self):
         """Use replacement history only when no original conversation items survive."""
@@ -140,18 +150,26 @@ class Session:
                 yield pos, line, item
 
 
-def rewound_transcripts():
-    """Collect replaced CLI IDs from Desktop rewind edges, preserving every current chat."""
+def desktop_session_dir():
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if not appdata:
-            return set()
+            return None
         root = Path(appdata) / "Claude"
     else:
         root = Path.home() / "Library" / "Application Support" / "Claude"
+    return root / "claude-code-sessions"
+
+
+def desktop_rewinds():
+    """Collect replaced CLI IDs from Desktop rewind edges, preserving every current chat."""
+    directory = desktop_session_dir()
+    if directory is None:
+        return {}, {}
     current = set()
-    rewound = set()
-    for path in (root / "claude-code-sessions").glob("*/*/local_*.json"):
+    owners = {}
+    links = {}
+    for path in directory.glob("*/*/local_*.json"):
         try:
             record = json.loads(path.read_bytes())
         except (OSError, ValueError):
@@ -172,33 +190,56 @@ def rewound_transcripts():
             for key in ("parent", "child"):
                 endpoint = edge.get(key)
                 if isinstance(endpoint, str) and UUID.fullmatch(endpoint):
-                    rewound.add(endpoint.lower())
-    return rewound - current
+                    owners[endpoint.lower()] = active.lower()
+            child, parent, point = (edge.get(k) for k in ("child", "parent", "forkPoint"))
+            if all(isinstance(v, str) and UUID.fullmatch(v) for v in (child, parent, point)):
+                links[child.lower()] = (parent.lower(), point.lower())
+    return {old: owner for old, owner in owners.items() if old not in current}, links
+
+
+def session_root(source):
+    variable = "CLAUDE_CONFIG_DIR" if source == "claude" else "CODEX_HOME"
+    return Path(os.getenv(variable, Path.home() / f".{source}"))
 
 
 def inventory(source=None, *, include_rewound=False):
-    roots = {
-        "claude": Path(os.getenv("CLAUDE_CONFIG_DIR", Path.home() / ".claude")),
-        "codex": Path(os.getenv("CODEX_HOME", Path.home() / ".codex")),
-    }
     patterns = {"claude": ["projects/*/*.jsonl"], "codex": [
         "sessions/**/rollout-*.jsonl*", "archived_sessions/**/rollout-*.jsonl*"]}
     found = {}
-    for kind, root in roots.items():
+    for kind in patterns:
         if source and kind != source:
             continue
-        hidden = rewound_transcripts() if kind == "claude" and not include_rewound else set()
+        hidden, links = desktop_rewinds() if kind == "claude" and not include_rewound else ({}, {})
         for pattern in patterns[kind]:
-            for path in root.glob(pattern):
+            for path in session_root(kind).glob(pattern):
                 name = path.name.removesuffix(".zst").removesuffix(".jsonl")
                 match = UUID.search(name)
                 if match and path.name.endswith((".jsonl", ".jsonl.zst")):
                     session_id = match.group().lower()
-                    if session_id in hidden:
-                        continue
                     item = Session(kind, session_id, path, path.stat().st_mtime)
                     if item.key not in found or found[item.key].modified < item.modified:
                         found[item.key] = item
+        if hidden:
+            from .rewind import RewindSession
+            for key, session in list(found.items()):
+                if session.source != "claude":
+                    continue
+                if session.id in hidden:
+                    continue
+                lineage = []
+                seen = {session.id}
+                ancestor = session.id
+                while ancestor in links:
+                    ancestor, point = links[ancestor]
+                    predecessor = found.get("claude:" + ancestor)
+                    if not predecessor or ancestor in seen:
+                        break
+                    seen.add(ancestor)
+                    lineage.append((predecessor, point))
+                if lineage:
+                    found[key] = RewindSession(session, lineage)
+            for ident in hidden:
+                found.pop("claude:" + ident, None)
     return sorted(found.values(), key=lambda x: x.modified, reverse=True)
 
 
@@ -221,15 +262,63 @@ def children(s):
             for p in sorted(directory.rglob("agent-*.jsonl"))]
 
 
-def resolve(sessions, key):
+def resolve(sessions, key, *, live_claude=False):
     parent, sep, child = key.partition("/")
     parent = parent.lower()
     matches = [s for s in sessions if (s.key if ":" in parent else s.id).startswith(parent)]
     if len(matches) == 1 and sep:
-        matches = [s for s in children(matches[0]) if s.id.partition("/")[2].startswith(child)]
+        matches = [s for s in matches[0].child_sessions() if s.id.partition("/")[2].startswith(child)]
+    if not matches and live_claude:
+        owners, _ = desktop_rewinds()
+        targets = {owner for old, owner in owners.items() if old.startswith(parent.removeprefix("claude:"))}
+        if len(targets) == 1:
+            raise ValueError(f"{key!r} was superseded; use current chat {targets.pop()} or --include-rewound")
     if len(matches) != 1:
         raise ValueError(f"{len(matches)} sessions match {key!r}; use list or a longer ID")
     return matches[0]
+
+
+@cache
+def desktop_titles():
+    """Map each chat's active transcript ID to the title Claude Desktop shows for it."""
+    directory = desktop_session_dir()
+    titles = {}
+    for path in directory.glob("*/*/local_*.json") if directory else ():
+        try:
+            record = json.loads(path.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict):
+            active, title = record.get("cliSessionId"), record.get("title")
+            if isinstance(active, str) and isinstance(title, str) and title:
+                titles[active.lower()] = title
+    return titles
+
+
+def latest_title(path):
+    """Return the newest title in a Claude transcript; forks begin with the parent's title."""
+    try:
+        with path.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            for key in ("customTitle", "aiTitle"):
+                needle = b'"' + key.encode() + b'"'
+                end = len(data)
+                while True:
+                    hit = data.rfind(needle, 0, end)
+                    if hit < 0:
+                        break
+                    begin = data.rfind(b"\n", 0, hit) + 1
+                    stop = data.find(b"\n", hit)
+                    try:
+                        record = json.loads(data[begin:stop]) if stop >= 0 else None
+                    except ValueError:
+                        record = None
+                    # The key can also occur inside quoted conversation text.
+                    if isinstance(record, dict) and isinstance(record.get(key), str) and record[key]:
+                        return record[key]
+                    end = begin
+    except (OSError, ValueError):
+        pass
+    return ""
 
 
 def meta(s):
@@ -253,6 +342,9 @@ def meta(s):
         title = title or r.get("customTitle") or r.get("aiTitle", "")
         if (project and title) or no >= 32:
             break
+    if s.source == "claude" and s.path.suffix == ".jsonl":
+        # Desktop renames are not always written back to the transcript.
+        title = desktop_titles().get(s.id) or latest_title(s.path) or title
     extra = {}
     if "/" in s.id:
         parent = s.id.split("/")[0]

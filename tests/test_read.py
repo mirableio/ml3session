@@ -106,6 +106,23 @@ class ReadTest(unittest.TestCase):
         self.assertEqual(hit["session"], child["session"])
         self.assertEqual(self.rows("read", child["session"], "--at", hit["cursor"])[0]["text"], "child evidence")
 
+    def test_fork_and_rename_use_latest_title(self):
+        quoted = {"type": "user", "message": {"content": 'mentions {"customTitle": "Quoted"} in text'}}
+        self.write({"type": "custom-title", "customTitle": "Parent chat"},
+                   {"type": "ai-title", "aiTitle": "Generated"}, quoted,
+                   {"type": "custom-title", "customTitle": "Forked chat"},
+                   {"type": "ai-title", "aiTitle": "Generated"}, quoted)
+        self.assertEqual(self.rows("list")[0]["title"], "Forked chat")
+        self.assertEqual(self.rows("list", "--title", "parent"), [])
+        self.write({"type": "ai-title", "aiTitle": "First"}, quoted, {"type": "ai-title", "aiTitle": "Second"})
+        self.assertEqual(self.rows("list", "--title", "second")[0]["title"], "Second")
+        self.env.update(HOME=str(self.root), APPDATA=str(self.root))
+        base = self.root if sys.platform == "win32" else self.root / "Library" / "Application Support"
+        chat = base / "Claude" / "claude-code-sessions" / "a" / "b" / "local_1.json"
+        chat.parent.mkdir(parents=True)
+        chat.write_text(json.dumps({"cliSessionId": self.id, "title": "Renamed in Desktop"}))
+        self.assertEqual(self.rows("list")[0]["title"], "Renamed in Desktop")
+
     def test_tool_tail_and_notifications(self):
         tool = {"type": "tool_result", "content": "begin " + "x" * 600 + " diagnostic tail"}
         self.write({"type": "user", "message": {"content": "<task-notification>done"}},
@@ -303,3 +320,34 @@ class ReadTest(unittest.TestCase):
         record["cliSessionId"] = old
         path.write_text(json.dumps(record))
         self.assertEqual({r["session"] for r in self.rows("list")}, {old, fork})
+
+    def test_retained_history_across_compaction_and_rewind(self):
+        self.env.update(HOME=str(self.root), APPDATA=str(self.root))
+        directory = self.root if sys.platform == "win32" else self.root / "Library/Application Support"
+        index = directory / "Claude/claude-code-sessions/account/workspace"
+        index.mkdir(parents=True)
+        latest = self.id[:-1] + "2"
+        point = self.id[:-1] + "3"
+        def prompt(uid, previous, text):
+            return {"uuid": uid, "parentUuid": previous, "type": "user", "message": {"content": text}}
+
+        start = prompt("first", None, "Retained early decision")
+        boundary = {"uuid": "boundary", "type": "system", "subtype": "compact_boundary",
+                    "parentUuid": None, "logicalParentUuid": "unpersisted"}
+        anchor = prompt(point, "boundary", "Shared decision")
+        self.write(start, boundary, anchor, prompt("old-tail", point, "Discarded decision"))
+        self.log = self.log.with_name(latest + ".jsonl")
+        self.write(boundary, anchor, prompt("current-tail", point, "Current decision"))
+        (index / "local_chat.json").write_text(json.dumps({"cliSessionId": latest, "rewindEdges": [
+            {"parent": self.id, "child": latest, "forkPoint": point}]}))
+        self.assertEqual([r["session"] for r in self.rows("list")], [latest])
+        rows = self.rows("read", latest)
+        self.assertEqual([r["text"] for r in rows[:-1]],
+                         ["Retained early decision", "Shared decision", "Current decision"])
+        hit, = self.rows("search", "Retained early")
+        self.assertEqual(hit["session"], latest)
+        self.assertEqual(self.rows("read", latest, "--at", hit["cursor"])[0], rows[0])
+        self.assertEqual(self.rows("read", latest, "--after", hit["cursor"])[:-1], rows[1:-1])
+        self.assertEqual(self.rows("search", "Discarded decision"), [])
+        self.assertEqual(self.rows("read", latest, "--last", "2")[:-1], rows[1:-1])
+        self.assertIn(latest, self.run_cli("read", self.id, check=False).stderr)

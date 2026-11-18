@@ -5,8 +5,8 @@ import hashlib
 import json
 import re
 
-from .sessions import ReadStats, meta
-from .transcript import events
+from .sessions import ReadStats
+
 
 def cursor(s, pos, line):
     number, index = pos
@@ -18,7 +18,7 @@ def boundary(s, value):
     if not value:
         return None
     key, sep, token = value.partition("@")
-    match = re.fullmatch(r"([1-9]\d*)\.[0-9a-f]{16}(?:~([1-9]\d*))?", token)
+    match = re.fullmatch(r"([1-9]\d*)\.[0-9a-f]{16}(?:~(-?[1-9]\d*))?", token)
     if key != s.key or not sep or not match:
         raise ValueError(f"invalid cursor for {s.key}: {value}")
     return int(match[1]), int(match[2] or 0)
@@ -52,7 +52,7 @@ def recent_prompt_window(session, count):
     stats = ReadStats()
     for number, line, record in session.conversation_records(tolerant=True, stats=stats):
         last_line = number
-        if next(events(session.source, record, outline=True), None) is not None:
+        if next(session.view_events(record, outline=True), None) is not None:
             prompts.append(cursor(session, number, line))
             if len(prompts) > count:
                 prompts.popleft()
@@ -79,7 +79,7 @@ def scan(a, s, searching=False):
     hits = used = 0
     more = False
     budget = getattr(a, "max_chars", None)
-    cwd = meta(s)["project"] if s.source == "codex" else None
+    cwd = s.metadata()["project"] if s.source == "codex" else None
     stats = ReadStats()
     skipped_at_cursor = 0
     for n, line, r in s.conversation_records(start=start, stop=stop,
@@ -95,7 +95,7 @@ def scan(a, s, searching=False):
             at = instant(stamp)
             if (a.start and at < a.start) or (a.end and at > a.end):
                 continue
-        rows = list(events(s.source, r, full=a.tools if searching else a.tools == "full",
+        rows = list(s.view_events(r, full=a.tools if searching else a.tools == "full",
                            outline=getattr(a, "outline", False), cwd=cwd,
                            include_tools=not searching or a.tools))
         if not rows:
@@ -111,7 +111,7 @@ def scan(a, s, searching=False):
                     continue
                 body = body[max(0, match.start()-80):match.end()+100].replace("\n", " ")
             item = dict(source=s.source, session=s.id, cursor=c, timestamp=stamp, role=role, text=body)
-            if n[1]:
+            if n[1] > 0:
                 item["history_source"] = "compacted"
             if searching and "/" in s.id:
                 item["parent"] = s.id.partition("/")[0]

@@ -4,11 +4,16 @@ import os
 import re
 import sys
 
+from .archive import load_archive
+from .backup import backup
 from .reader import instant, render, scan
-from .sessions import children, inventory, meta, resolve
+from .sessions import inventory, resolve
+from zipfile import BadZipFile
 
 def main():
     guide = """Commands
+  backup [ZIP]   Back up all local sessions, including archived and rewound history.
+                 Default: compact decision traces. Use --native for original files.
   list           List session IDs, projects and titles, newest activity first.
   search QUERY   Find a literal phrase in conversation text, ignoring case.
                  Quote multi-word queries. Hits include an excerpt and cursor.
@@ -16,6 +21,7 @@ def main():
                  Use a session UUID or a prefix unique within the source.
 
 Options (place after the command)
+  --archive ZIP    List, search or read the saved physical sessions in a trace ZIP.
   --json           All commands. Print one JSON object per line.
   --project TEXT   List or search. Match part of the working directory,
                    ignoring case.
@@ -55,6 +61,15 @@ printed at the end of the last successful read.
 
 Sources default to ~/.claude (CLAUDE_CONFIG_DIR) and ~/.codex (CODEX_HOME)."""
     details = {
+        "backup": ("Create a ZIP of local session history.",
+                   """Run from the directory where you want to save the ZIP, or give an output path.
+Default filenames include the source and UTC timestamp. Existing files are never overwritten.
+Trace mode keeps messages, recorded reasoning text and compact tool evidence.
+Native mode keeps original transcripts and available session metadata. See README for restoration.
+
+Examples
+  ml3session claude backup
+  ml3session codex backup /path/to/backup.zip --native"""),
         "list": ("Find session IDs by project and recent activity.",
                  """Results are ordered by transcript modification time, newest first.
 Each row gives the source, session ID and available project, title and parent
@@ -108,10 +123,15 @@ telemetry are skipped; non-text message attachments are indicated by type."""),
         for cmd, (summary, examples) in details.items():
             sub = subs.add_parser(cmd, help=summary, description=summary, epilog=examples,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-            if source == "claude":
+            if source == "claude" and cmd != "backup":
                 sub.add_argument("--include-rewound", action="store_true",
                                  help="also include superseded Claude Desktop rewind transcripts")
             sub.add_argument("--json", action="store_true", help="emit JSON Lines for scripts and agents")
+            if cmd == "backup":
+                sub.add_argument("zip", nargs="?", help="output ZIP path (default: timestamped file here)")
+                sub.add_argument("--native", action="store_true", help="archive original transcripts and metadata")
+                continue
+            sub.add_argument("--archive", metavar="ZIP", help="use a trace ZIP instead of live session files")
             if cmd != "read":
                 sub.add_argument("--project", help="case-insensitive substring of the working directory")
                 sub.add_argument("--limit", type=int, default=20, metavar="N",
@@ -158,9 +178,16 @@ telemetry are skipped; non-text message attachments are indicated by type."""),
         args.append("--help")
     a = parser.parse_args(args)
     try:
+        if a.command == "backup":
+            print(render(a, backup(a.source, a.zip, a.native)))
+            return
         if getattr(a, "start", None) and a.end and a.start > a.end:
             raise ValueError("--to precedes --from")
-        sessions = inventory(a.source, include_rewound=getattr(a, "include_rewound", False))
+        if a.archive:
+            sessions = load_archive(a.archive, a.source)
+        else:
+            sessions = inventory(a.source, include_rewound=getattr(a, "include_rewound", False))
+        live_claude = a.source == "claude" and not a.archive
         if a.command == "read":
             if a.last is not None:
                 if a.last < 1:
@@ -173,13 +200,13 @@ telemetry are skipped; non-text message attachments are indicated by type."""),
                 a.until = a.at
             if a.max_chars is not None and a.max_chars < 1:
                 raise ValueError("--max-chars must be positive")
-            scan(a, resolve(sessions, a.session))
+            scan(a, resolve(sessions, a.session, live_claude=live_claude))
             return
         if getattr(a, "children", None):
-            sessions = children(resolve(sessions, a.children))
+            sessions = resolve(sessions, a.children, live_claude=live_claude).child_sessions()
             sessions.sort(key=lambda child: child.modified, reverse=True)
         if a.command == "search" and a.source == "claude" and not a.no_children:
-            descendants = [child for session in sessions for child in children(session)]
+            descendants = [child for session in sessions for child in session.child_sessions()]
             sessions = sorted(sessions + descendants, key=lambda item: item.modified, reverse=True)
         if a.limit < 1:
             raise ValueError("--limit must be positive")
@@ -188,7 +215,7 @@ telemetry are skipped; non-text message attachments are indicated by type."""),
             a.pattern = re.compile(re.escape(a.query), re.IGNORECASE)
         for s in sessions:
             if a.command == "list" or a.project:
-                info = meta(s)
+                info = s.metadata()
                 if a.project and a.project.casefold() not in info["project"].casefold():
                     continue
             if a.command == "list":
@@ -202,5 +229,5 @@ telemetry are skipped; non-text message attachments are indicated by type."""),
                 break
     except BrokenPipeError:
         sys.stdout = open(os.devnull, "w")
-    except (ValueError, OSError, EOFError) as e:
+    except (ValueError, OSError, EOFError, BadZipFile) as e:
         parser.exit(2, f"ml3session: {e}\n")

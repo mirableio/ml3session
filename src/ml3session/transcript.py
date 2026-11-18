@@ -88,7 +88,7 @@ def tool_text(block, role, cwd, full, hint=None):
     return " ".join(filter(None, (name, identifier, preview, *missing)))
 
 
-def blocks(role, content, cwd, full, hint=None, include_tools=True):
+def blocks(role, content, cwd, full, hint=None, include_tools=True, include_thinking=False):
     if isinstance(content, str):
         yield role, content
         return
@@ -99,6 +99,10 @@ def blocks(role, content, cwd, full, hint=None, include_tools=True):
         elif t in ("tool_use", "tool_result"):
             if include_tools:
                 yield t, tool_text(b, t, cwd, full, hint)
+        elif t == "thinking" and include_thinking:
+            text = b.get("thinking")
+            if isinstance(text, str) and text.strip():
+                yield "thinking", text
         elif t not in ("thinking", "redacted_thinking"):
             sibling = content[index + 1] if index + 1 < len(content) else {}
             note = IMAGE_NOTE.match(sibling.get("text") or "")
@@ -133,7 +137,7 @@ def visible_codex_item(item):
             or kind.endswith(("_call", "_call_output")) or kind == "tool_search_output")
 
 
-def events(source, r, full=False, outline=False, cwd=None, include_tools=True):
+def events(source, r, full=False, outline=False, cwd=None, include_tools=True, include_thinking=False):
     cwd = r.get("cwd") or cwd
     if source == "claude":
         role = r.get("type")
@@ -181,4 +185,4 @@ def events(source, r, full=False, outline=False, cwd=None, include_tools=True):
                                                           "<task-notification>", "<local-command-", "<command-name>", "# AGENTS.md instructions")):
             yield role, " ".join(text.split())[:240]
     else:
-        yield from blocks(role, content, cwd, full, hint, include_tools)
+        yield from blocks(role, content, cwd, full, hint, include_tools, include_thinking)

@@ -22,6 +22,11 @@ else:
 
 
 UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+FIRST_UUID = re.compile(UUID.pattern[:-1])
+
+
+def transcript_stem(path):
+    return path.name.removesuffix(".zst").removesuffix(".jsonl")
 
 
 @dataclass
@@ -69,18 +74,58 @@ class Session:
     id: str
     path: Path
     modified: float
+    # Codex continues a thread in further rollout files after an edited turn.
+    parts: tuple = ()
+    aliases: tuple = ()
 
     @property
     def key(self):
         return f"{self.source}:{self.id}"
 
+    @property
+    def files(self):
+        return self.parts or (self.path,)
+
+    @cached_property
+    def segments(self):
+        """Pair each rollout file with the byte length its successor retained."""
+        if len(self.files) == 1:
+            return [(self.path, None)]
+        kept = []
+        for path in self.files:
+            base = {}
+            if kept:
+                try:
+                    with (open_zstd if path.suffix == ".zst" else open)(path, "rb") as stream:
+                        payload = json.loads(stream.readline()).get("payload")
+                    base = payload.get("history_base")
+                except (OSError, EOFError, ValueError, AttributeError):
+                    pass
+            if base is None:
+                # Editing the first prompt restarts the thread with nothing retained.
+                kept.clear()
+            elif isinstance(base, dict) and isinstance(base.get("end_byte_offset"), int):
+                # The edited turn at the end of the continued file was replaced.
+                for index in range(len(kept) - 1, -1, -1):
+                    if kept[index][0] == base.get("thread_id"):
+                        del kept[index + 1:]
+                        kept[index][2] = base["end_byte_offset"]
+                        break
+            kept.append([UUID.search(transcript_stem(path)).group().lower(), path, None])
+        return [(path, limit) for _, path, limit in kept]
+
     def lines(self):
-        opener = open_zstd if self.path.suffix == ".zst" else open
-        with opener(self.path, "rb") as stream:
-            for no, line in enumerate(stream, 1):
-                if not line.endswith(b"\n"):
-                    break  # A writer may still be appending this record.
-                yield no, line
+        no = 0
+        for path, limit in self.segments:
+            with (open_zstd if path.suffix == ".zst" else open)(path, "rb") as stream:
+                read = 0
+                for line in stream:
+                    # A writer may still be appending the last record.
+                    if not line.endswith(b"\n") or (limit is not None and read >= limit):
+                        break
+                    read += len(line)
+                    no += 1
+                    yield no, line
 
     def records(self, *, start=1, stop=None, tolerant=False, stats=None, warn=True):
         warned = False
@@ -210,15 +255,23 @@ def inventory(source=None, *, include_rewound=False):
         if source and kind != source:
             continue
         hidden, links = desktop_rewinds() if kind == "claude" and not include_rewound else ({}, {})
+        threads = {}
         for pattern in patterns[kind]:
             for path in session_root(kind).glob(pattern):
-                name = path.name.removesuffix(".zst").removesuffix(".jsonl")
-                match = UUID.search(name)
+                name = transcript_stem(path)
+                # A Codex continuation is named THREAD_SEGMENT; a fork has its own thread ID.
+                match = FIRST_UUID.search(name) if UUID.search(name) else None
                 if match and path.name.endswith((".jsonl", ".jsonl.zst")):
-                    session_id = match.group().lower()
-                    item = Session(kind, session_id, path, path.stat().st_mtime)
-                    if item.key not in found or found[item.key].modified < item.modified:
-                        found[item.key] = item
+                    files = threads.setdefault(match.group().lower(), {})
+                    modified = path.stat().st_mtime
+                    if name not in files or files[name][1] < modified:
+                        files[name] = (path, modified)
+        for session_id, files in threads.items():
+            parts = tuple(path for _, (path, _) in sorted(files.items()))
+            aliases = tuple(UUID.search(name).group().lower() for name in sorted(files))[1:]
+            found[f"{kind}:{session_id}"] = Session(
+                kind, session_id, parts[0], max(modified for _, modified in files.values()),
+                parts if len(parts) > 1 else (), aliases)
         if hidden:
             from .rewind import RewindSession
             for key, session in list(found.items()):
@@ -266,6 +319,9 @@ def resolve(sessions, key, *, live_claude=False):
     parent, sep, child = key.partition("/")
     parent = parent.lower()
     matches = [s for s in sessions if (s.key if ":" in parent else s.id).startswith(parent)]
+    if not matches and ":" not in parent:
+        # The ID of one continuation file opens the thread it belongs to.
+        matches = [s for s in sessions if any(a.startswith(parent) for a in getattr(s, "aliases", ()))]
     if len(matches) == 1 and sep:
         matches = [s for s in matches[0].child_sessions() if s.id.partition("/")[2].startswith(child)]
     if not matches and live_claude:
@@ -329,7 +385,8 @@ def meta(s):
             p = r["payload"]
             project = p.get("cwd", "")
             title = codex_titles().get(s.id, "")
-            parent = (p.get("history_base") or {}).get("thread_id") or p.get("forked_from_id")
+            # history_base can name one continuation file of the parent thread.
+            parent = p.get("forked_from_id") or (p.get("history_base") or {}).get("thread_id")
             break
         project = project or r.get("cwd", "")
         if not project and s.source == "codex" and r.get("type") == "message" and r.get("role") == "user":

@@ -123,6 +123,45 @@ class ReadTest(unittest.TestCase):
         chat.write_text(json.dumps({"cliSessionId": self.id, "title": "Renamed in Desktop"}))
         self.assertEqual(self.rows("list")[0]["title"], "Renamed in Desktop")
 
+    def test_codex_continuation_joins_thread_and_fork_stays_separate(self):
+        def message(role, text):
+            return {"type": "response_item", "payload": {"type": "message", "role": role, "content": text}}
+
+        def rollout(name, meta, *records):
+            lines = [json.dumps(r) + "\n" for r in ({"type": "session_meta", "payload": meta}, *records)]
+            (self.root / "sessions" / ("rollout-" + name + ".jsonl")).write_text("".join(lines))
+            return lines
+
+        (self.root / "sessions").mkdir()
+        thread, part, fork = self.id, self.id[:-1] + "2", self.id[:-1] + "3"
+        first = rollout("2000-01-01T00-00-00-" + thread, {"id": thread, "cwd": "/demo"},
+                        message("user", "kept question"), message("assistant", "kept answer"),
+                        message("user", "interrupted prompt"))
+        kept = sum(len(line) for line in first[:3])
+        rollout("2000-01-02T00-00-00-" + thread + "_" + part,
+                {"id": thread, "history_base": {"thread_id": thread, "end_byte_offset": kept}},
+                message("user", "edited prompt"), message("assistant", "final answer"))
+        rollout("2000-01-03T00-00-00-" + fork,
+                {"id": fork, "forked_from_id": thread, "cwd": "/demo",
+                 "history_base": {"thread_id": part, "end_byte_offset": 1}},
+                message("user", "fork question"))
+        listed = {row["session"]: row for row in self.rows("list", source="codex")}
+        self.assertEqual(set(listed), {thread, fork})
+        self.assertEqual(listed[fork]["parent"], thread)
+        rows = self.rows("read", thread, source="codex")
+        self.assertEqual([row["text"] for row in rows[:-1]],
+                         ["kept question", "kept answer", "edited prompt", "final answer"])
+        self.assertEqual(self.rows("read", part, "--last", "1", source="codex")[0]["text"], "edited prompt")
+        self.assertEqual(self.rows("search", "interrupted", source="codex"), [])
+        hit, = self.rows("search", "final answer", source="codex")
+        self.assertEqual(hit["session"], thread)
+        self.assertEqual(self.rows("read", thread, "--at", hit["cursor"], source="codex")[0]["text"], "final answer")
+        self.assertEqual([row["text"] for row in self.rows("read", fork, source="codex")[:-1]], ["fork question"])
+        rollout("2000-01-04T00-00-00-" + thread + "_" + self.id[:-1] + "4", {"id": thread},
+                message("user", "rewritten first prompt"))
+        self.assertEqual([row["text"] for row in self.rows("read", thread, source="codex")[:-1]],
+                         ["rewritten first prompt"])
+
     def test_tool_tail_and_notifications(self):
         tool = {"type": "tool_result", "content": "begin " + "x" * 600 + " diagnostic tail"}
         self.write({"type": "user", "message": {"content": "<task-notification>done"}},

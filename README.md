@@ -115,5 +115,6 @@ The `claude/` and `codex/` trees mirror their respective configuration directori
 - Older Codex rollouts can lack message timestamps. Their rows show `null` in JSON and can be selected by cursor. Time filters include only timestamped rows.
 - When a Codex transcript contains only retained compaction history, the CLI reads the latest available conversation snapshot. Those rows carry `history_source: "compacted"` in JSON and a cursor for each snapshot item. Original message times may be unavailable.
 - Each read follows one transcript in recorded order. For a Codex fork, earlier turns may live in the parent session listed by `list`.
+- When you edit or resend a prompt, Codex continues the same chat in a further rollout file. The CLI reads those files as one session, without the turn the edit replaced. The ID of a continuation file also opens its chat. A fork has its own session ID and stays separate.
 - If a transcript contains malformed lines, the CLI warns on stderr. The read footer gives their count in `skipped_lines` and their inclusive, one-based ranges in `skipped_line_ranges`. Use `--strict` when missing evidence should fail the read.
 - Cursors identify a session, physical line, and content digest. A changed or missing cursor causes an error. Discard partial output from a failed command and locate the exchange again with `search` or `--outline`.

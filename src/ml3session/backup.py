@@ -130,8 +130,12 @@ def backup(source, destination=None, native=False):
             for session in sessions:
                 entry = meta(session)
                 if native:
-                    entry["file"] = source + "/" + session.path.relative_to(root).as_posix()
-                    write_original(archive, session.path, entry["file"])
+                    names = [source + "/" + path.relative_to(root).as_posix() for path in session.files]
+                    entry["file"] = names[0]
+                    if names[1:]:
+                        entry["continuation_files"] = names[1:]
+                    for path, name in zip(session.files, names):
+                        write_original(archive, path, name)
                     sidecar = session.path.with_suffix(".meta.json")
                     if source == "claude" and "/" in session.id and sidecar.exists():
                         write_original(archive, sidecar, source + "/" + sidecar.relative_to(root).as_posix())

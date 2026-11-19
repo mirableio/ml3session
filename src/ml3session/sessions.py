@@ -77,6 +77,9 @@ class Session:
     # Codex continues a thread in further rollout files after an edited turn.
     parts: tuple = ()
     aliases: tuple = ()
+    # Backups also read the turns a continuation replaced, and note their lines here.
+    with_replaced: bool = False
+    replaced_lines: set = field(default_factory=set)
 
     @property
     def key(self):
@@ -116,15 +119,23 @@ class Session:
 
     def lines(self):
         no = 0
-        for path, limit in self.segments:
+        retained = dict(self.segments)
+        for path in self.files if self.with_replaced else retained:
+            limit = retained.get(path, 0)
             with (open_zstd if path.suffix == ".zst" else open)(path, "rb") as stream:
                 read = 0
                 for line in stream:
                     # A writer may still be appending the last record.
-                    if not line.endswith(b"\n") or (limit is not None and read >= limit):
+                    if not line.endswith(b"\n"):
                         break
-                    read += len(line)
+                    replaced = limit is not None and read >= limit
+                    if replaced and not self.with_replaced:
+                        break
+                    # Number only emitted lines, so cursors match across both modes' retained rows.
                     no += 1
+                    if replaced:
+                        self.replaced_lines.add(no)
+                    read += len(line)
                     yield no, line
 
     def records(self, *, start=1, stop=None, tolerant=False, stats=None, warn=True):
@@ -165,6 +176,8 @@ class Session:
             return None
         latest = None
         for number, _, record in self.records(tolerant=True, warn=False):
+            if number in self.replaced_lines:
+                continue  # A backup also reads replaced turns; they do not decide this.
             if visible_codex_item(codex_item(record)):
                 return None
             if record.get("type") == "compacted":
@@ -422,6 +435,6 @@ def meta(s):
                     extra["prompt_preview"] = prompt[1]
                     break
     elif s.source == "claude":
-        extra["child_count"] = len(children(s))
+        extra["child_count"] = len(s.child_sessions())
     return dict(source=s.source, session=s.id, project=project, title=title, parent=parent,
                 modified=datetime.fromtimestamp(s.modified, timezone.utc).isoformat(), **extra)

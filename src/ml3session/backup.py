@@ -1,5 +1,6 @@
 """Write portable decision traces or original local session files to a ZIP."""
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timezone
 import errno
 import json
@@ -28,10 +29,15 @@ def write_trace(archive, session, entry):
     name = f"traces/{session.id}.jsonl"
     stats = ReadStats()
     count = 0
+    if session.parts:
+        # Keep the turns that an edited prompt replaced; live reads leave them out.
+        session = replace(session, with_replaced=True, replaced_lines=set())
     with archive.open(name, "w", force_zip64=True) as stream:
         for (line, index), _, record in session.conversation_records(tolerant=True, stats=stats):
             for role, text in decision_events(session.source, record, entry["project"]):
                 row = dict(line=line, timestamp=record.get("timestamp"), role=role, text=text)
+                if line in session.replaced_lines:
+                    row["replaced"] = True
                 if index:
                     row["snapshot_item"] = index
                 message_id = record.get("uuid") or (codex_item(record) or {}).get("id")

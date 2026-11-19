@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from zipfile import ZipFile
 
 
 class ReadTest(unittest.TestCase):
@@ -152,15 +153,77 @@ class ReadTest(unittest.TestCase):
         self.assertEqual([row["text"] for row in rows[:-1]],
                          ["kept question", "kept answer", "edited prompt", "final answer"])
         self.assertEqual(self.rows("read", part, "--last", "1", source="codex")[0]["text"], "edited prompt")
+        # Three retained lines, then the continuation's header: the replaced line takes no number.
+        self.assertIn("@5.", rows[2]["cursor"])
         self.assertEqual(self.rows("search", "interrupted", source="codex"), [])
         hit, = self.rows("search", "final answer", source="codex")
         self.assertEqual(hit["session"], thread)
         self.assertEqual(self.rows("read", thread, "--at", hit["cursor"], source="codex")[0]["text"], "final answer")
         self.assertEqual([row["text"] for row in self.rows("read", fork, source="codex")[:-1]], ["fork question"])
+        archive = self.root / "trace.zip"
+        self.run_cli("backup", str(archive), source="codex")
+        with ZipFile(archive) as saved:
+            trace = [json.loads(line) for line in saved.read("traces/" + thread + ".jsonl").decode().splitlines()]
+        self.assertEqual([r["text"] for r in trace if r.get("replaced")], ["interrupted prompt"])
+        self.assertEqual([r["text"] for r in self.rows("read", thread, "--archive", str(archive), source="codex")[:-1]],
+                         ["kept question", "kept answer", "edited prompt", "final answer"])
+        # A retained history that survives only as a compaction snapshot stays in the backup.
+        other = self.id[:-1] + "5"
+        snapshot = {"type": "compacted", "payload": {"replacement_history": [
+            {"type": "message", "role": "user", "content": "snapshot prompt"}]}}
+        head = rollout("2000-01-05T00-00-00-" + other, {"id": other}, snapshot, message("user", "dropped after snapshot"))
+        rollout("2000-01-06T00-00-00-" + other + "_" + self.id[:-1] + "6",
+                {"id": other, "history_base": {"thread_id": other, "end_byte_offset": sum(map(len, head[:2]))}})
+        self.assertEqual([r["text"] for r in self.rows("read", other, source="codex")[:-1]], ["snapshot prompt"])
+        archive = self.root / "snapshot.zip"
+        self.run_cli("backup", str(archive), source="codex")
+        with ZipFile(archive) as saved:
+            trace = [json.loads(line) for line in saved.read("traces/" + other + ".jsonl").decode().splitlines()]
+        self.assertEqual([(r["text"], r.get("replaced", False)) for r in trace],
+                         [("snapshot prompt", False), ("dropped after snapshot", True)])
+        self.assertEqual([r["text"] for r in self.rows("read", other, "--archive", str(archive), source="codex")[:-1]],
+                         ["snapshot prompt"])
         rollout("2000-01-04T00-00-00-" + thread + "_" + self.id[:-1] + "4", {"id": thread},
                 message("user", "rewritten first prompt"))
         self.assertEqual([row["text"] for row in self.rows("read", thread, source="codex")[:-1]],
                          ["rewritten first prompt"])
+
+    def test_rewind_keeps_parallel_tools_repeated_ids_and_earlier_agents(self):
+        self.env.update(HOME=str(self.root), APPDATA=str(self.root))
+        directory = self.root if sys.platform == "win32" else self.root / "Library/Application Support"
+        index = directory / "Claude/claude-code-sessions/account/workspace"
+        index.mkdir(parents=True)
+        latest, point = self.id[:-1] + "2", self.id[:-1] + "3"
+
+        def row(uid, previous, text, minute, kind="user"):
+            return json.dumps({"uuid": uid, "parentUuid": previous, "type": kind, "message": {"content": text},
+                               "timestamp": f"2000-01-01T00:{minute:02}:00Z"})
+
+        boundary = json.dumps({"uuid": "boundary", "type": "system", "subtype": "compact_boundary",
+                               "parentUuid": None, "logicalParentUuid": "first"}, separators=(",", ":"))
+        first = row("first", None, "Early prompt", 1)
+        anchor = row(point, "boundary", "Shared prompt", 5)
+        # Two tool calls run at once: the second result hangs off the first call, not the main chain.
+        self.write(first, row("call-a", "first", "call a", 2, "assistant"), row("call-b", "call-a", "call b", 2, "assistant"),
+                   row("result-a", "call-a", "Sibling result", 3), row("result-b", "call-b", "result b", 3),
+                   first, boundary, anchor, row("old-tail", point, "Discarded prompt", 9))
+        for name, minute in (("agent-early", 4), ("agent-late", 8)):
+            agent = self.log.with_suffix("") / "subagents" / (name + ".jsonl")
+            agent.parent.mkdir(parents=True, exist_ok=True)
+            agent.write_text(row(name, None, name + " evidence", minute, "assistant") + "\n")
+        self.log = self.log.with_name(latest + ".jsonl")
+        self.write(boundary, anchor, row("current-tail", point, "Current prompt", 10))
+        (index / "local_chat.json").write_text(json.dumps({"cliSessionId": latest, "rewindEdges": [
+            {"parent": self.id, "child": latest, "forkPoint": point}]}))
+        texts = [r["text"] for r in self.rows("read", latest)[:-1]]
+        self.assertEqual(texts, ["Early prompt", "call a", "call b", "Sibling result", "result b",
+                                 "Shared prompt", "Current prompt"])
+        listed, = self.rows("list")
+        self.assertEqual(listed["child_count"], 1)
+        hit, = self.rows("search", "agent-early evidence")
+        self.assertEqual(hit["parent"], latest)
+        self.assertEqual(self.rows("read", hit["session"], "--at", hit["cursor"])[0]["text"], "agent-early evidence")
+        self.assertEqual(self.rows("search", "agent-late evidence"), [])
 
     def test_tool_tail_and_notifications(self):
         tool = {"type": "tool_result", "content": "begin " + "x" * 600 + " diagnostic tail"}

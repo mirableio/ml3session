@@ -41,6 +41,8 @@ class TraceSession:
         with ZipFile(self.path) as archive, archive.open(self.entry["file"]) as stream:
             for _, group in groupby(numbered_rows(stream), key=source_record):
                 rows = list(group)
+                if rows[0][2].get("replaced"):
+                    continue  # A turn the user edited away; kept in the ZIP for the record.
                 pos = (rows[0][0], 0)
                 if start and pos < start:
                     continue
